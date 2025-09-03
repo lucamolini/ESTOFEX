@@ -1,3 +1,5 @@
+# estofex_mailer.py (robusto)
+
 import os
 import re
 import ssl
@@ -10,8 +12,8 @@ from urllib.parse import urljoin, urlparse, parse_qs, urlencode, urlunparse
 import requests
 from bs4 import BeautifulSoup
 
-
 LIST_URL = os.getenv("LIST_URL", "https://www.estofex.org/cgi-bin/polygon/showforecast.cgi?list=yes")
+ALT_LIST_URL = "https://www.estofex.org/cgi-bin/polygon/showforecast.cgi?all=yes&list=yes"
 FILENAME_BASE = os.getenv("FILENAME_BASE", "estofex_latest")
 
 TO_EMAIL = os.getenv("TO_EMAIL", "luca.molini@cimafoundation.org")
@@ -22,12 +24,17 @@ DEBUG_SMTP = os.getenv("DEBUG_SMTP", "0").strip() == "1"
 CC_EMAILS = os.getenv("CC_EMAILS", "").strip()
 BCC_EMAILS = os.getenv("BCC_EMAILS", "").strip()
 
-ROME_HOUR_GATE = os.getenv("ROME_HOUR_GATE", "").strip()    # es. "17"; vuoto = no gate
+ROME_HOUR_GATE = os.getenv("ROME_HOUR_GATE", "").strip()  # es. "17"; vuoto = no gate
 FORCE_SEND = os.getenv("FORCE_SEND", "false").strip().lower() == "true"
+
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+    "Accept-Language": "en-US,en;q=0.9,it;q=0.8",
+}
 
 
 def guard_by_rome_hour() -> bool:
-    """Se FORCE_SEND è attivo, bypassa il gate orario; altrimenti rispetta ROME_HOUR_GATE (se definito)."""
     if FORCE_SEND:
         print("[INFO] FORCE_SEND=true -> bypass controllo orario Europe/Rome.")
         return True
@@ -35,84 +42,107 @@ def guard_by_rome_hour() -> bool:
         return True
     now_rome = datetime.now(ZoneInfo("Europe/Rome"))
     if str(now_rome.hour) != str(ROME_HOUR_GATE):
-        print(f"[INFO] Europe/Rome ora {now_rome:%Y-%m-%d %H:%M:%S}; gate={ROMЕ_HOUR_GATE} -> skip invio email.")
+        print(f"[INFO] Europe/Rome ora {now_rome:%Y-%m-%d %H:%M:%S}; gate={ROME_HOUR_GATE} -> skip invio email.")
         return False
     return True
 
 
+def extract_fcst_links_from_html(html: str, base_url: str):
+    """Estrae TUTTI i link a showforecast.cgi con fcstfile=... (DOM + regex fallback)."""
+    links = []
+
+    # 1) DOM parsing
+    try:
+        soup = BeautifulSoup(html, "html.parser")
+        for a in soup.find_all("a", href=True):
+            href = a["href"]
+            if re.search(r"showforecast\.cgi.*fcstfile=", href, re.I):
+                links.append(urljoin(base_url, href))
+    except Exception:
+        pass
+
+    # 2) Regex fallback (se DOM non ha trovato nulla)
+    if not links:
+        for m in re.finditer(r'(?:href=["\']?)?(/?cgi-bin/\S*showforecast\.cgi\?[^"\'\s>]*fcstfile=[^"\'\s>]+)',
+                             html, flags=re.I):
+            href = m.group(1)
+            links.append(urljoin(base_url, href))
+
+    # Dedup preservando l'ordine
+    seen = set()
+    uniq = []
+    for u in links:
+        if u not in seen:
+            uniq.append(u)
+            seen.add(u)
+    return uniq
+
+
 def find_latest_fcst_url(list_url: str) -> str:
-    """
-    Apre la pagina 'list=yes' e ricava il link al forecast più recente
-    (ancora valido). Preferisce '...stormforecast.xml'; se non trovato, usa il primo fcstfile disponibile.
-    """
-    print(f"[INFO] Apertura lista: {list_url}")
-    r = requests.get(list_url, timeout=30)
-    r.raise_for_status()
-    soup = BeautifulSoup(r.text, "html.parser")
+    """Trova il forecast più recente dalla lista; preferisce 'stormforecast.xml'."""
+    for attempt, url in enumerate([list_url, ALT_LIST_URL], start=1):
+        print(f"[INFO] ({attempt}/2) Apertura lista: {url}")
+        r = requests.get(url, headers=HEADERS, timeout=30, allow_redirects=True)
+        r.raise_for_status()
+        html = r.text
+        links = extract_fcst_links_from_html(html, url)
+        if not links:
+            print("[WARN] Nessun link trovato in questa lista (potrebbe essere markup minimale). "
+                  f"Primi 300 char: {html[:300]!r}")
+            continue
 
-    # Trova tutti i link con fcstfile=...
-    anchors = soup.find_all("a", href=re.compile(r"showforecast\.cgi\?fcstfile=", re.I))
-    if not anchors:
-        raise RuntimeError("Nessun link di forecast trovato nella lista ESTOFEX.")
+        # preferisci stormforecast.xml, altrimenti prendi il primo
+        def is_stormforecast(u: str) -> bool:
+            return "stormforecast.xml" in u.lower()
 
-    # Ordine pagina = più recente in alto → prendi il primo 'stormforecast', altrimenti il primo in assoluto
-    def is_stormforecast(href: str) -> bool:
-        return bool(re.search(r"stormforecast\.xml", href))
+        best = next((u for u in links if is_stormforecast(u)), links[0])
+        print(f"[INFO] Forecast più recente: {best}")
+        return best
 
-    first_storm = next((a for a in anchors if is_stormforecast(a.get("href", ""))), None)
-    target = first_storm or anchors[0]
-    href = target.get("href")
-    full = urljoin(list_url, href)
-    print(f"[INFO] Forecast più recente: {full}")
-    return full
+    raise RuntimeError("Nessun link di forecast trovato nelle liste ESTOFEX.")
 
 
 def to_map_image_url(forecast_url: str) -> str:
-    """
-    Converte un link tipo ...showforecast.cgi?fcstfile=...&text=yes
-    in ...showforecast.cgi?fcstfile=...&lightningmap=yes (endpoint immagine).
-    """
+    """...&text=yes -> ...&lightningmap=yes"""
     u = urlparse(forecast_url)
     qs = parse_qs(u.query, keep_blank_values=True)
-    # mantieni fcstfile, sostituisci text=yes -> lightningmap=yes
     qs.pop("text", None)
     qs["lightningmap"] = ["yes"]
     new_query = urlencode({k: v[0] if isinstance(v, list) else v for k, v in qs.items()})
-    new_url = urlunparse((u.scheme, u.netloc, u.path, u.params, new_query, u.fragment))
-    print(f"[INFO] URL immagine mappa: {new_url}")
-    return new_url
+    return urlunparse((u.scheme, u.netloc, u.path, u.params, new_query, u.fragment))
 
 
 def download_map_image(img_url: str, base_name: str) -> str:
-    """Scarica l'immagine della mappa e salva come <base_name>_YYYYMMDD.png (o .gif)."""
-    r = requests.get(img_url, timeout=60)
+    r = requests.get(img_url, headers=HEADERS, timeout=60)
     r.raise_for_status()
-    ctype = r.headers.get("Content-Type", "").lower()
-    if "png" in ctype:
+    ctype = (r.headers.get("Content-Type") or "").lower()
+
+    if "image/" not in ctype:
+        # fallback: prova da estensione nell'URL
+        print(f"[WARN] Content-Type inatteso: {ctype!r}. Provo a inferire dall'URL.")
+    if "png" in ctype or img_url.lower().endswith(".png"):
         ext = "png"
-    elif "gif" in ctype:
+    elif "gif" in ctype or img_url.lower().endswith(".gif"):
         ext = "gif"
-    elif "jpeg" in ctype or "jpg" in ctype:
+    elif "jpeg" in ctype or "jpg" in ctype or img_url.lower().endswith((".jpg", ".jpeg")):
         ext = "jpg"
     else:
-        # fallback: prova a inferire da url
-        ext = "png" if img_url.lower().endswith(".png") else "gif" if img_url.lower().endswith(".gif") else "png"
+        ext = "png"
 
     today = datetime.now(ZoneInfo("Europe/Rome")).strftime("%Y%m%d")
     filename = f"{base_name}_{today}.{ext}"
     with open(filename, "wb") as f:
         f.write(r.content)
 
-    # Copia anche un nome fisso per eventuale artifact
-    with open(f"{base_name}.{'png' if ext=='png' else ext}", "wb") as f:
+    # copia anche il nome fisso
+    with open(f"{base_name}.{ext}", "wb") as f:
         f.write(r.content)
 
-    print(f"[OK] Mappa salvata: {filename}")
+    print(f"[OK] Mappa salvata: {filename} (e {base_name}.{ext})")
     return filename
 
 
 def send_email_with_attachment(path: str) -> bool:
-    """Invia la mail con allegato; ritorna True/False."""
     SMTP_HOST = os.getenv("SMTP_HOST")
     SMTP_PORT = int(os.getenv("SMTP_PORT", "465"))
     SMTP_USER = os.getenv("SMTP_USER")
@@ -126,7 +156,6 @@ def send_email_with_attachment(path: str) -> bool:
         print(f"[ERROR] Config SMTP mancante: {', '.join(missing)}. Email NON inviata.")
         return False
 
-    # Destinatari
     cc_list = [x.strip() for x in CC_EMAILS.split(",") if x.strip()]
     bcc_list = [x.strip() for x in BCC_EMAILS.split(",") if x.strip()]
     all_rcpts = [TO_EMAIL] + cc_list + bcc_list
@@ -140,7 +169,6 @@ def send_email_with_attachment(path: str) -> bool:
     msg["Date"] = datetime.now(ZoneInfo("Europe/Rome")).strftime("%a, %d %b %Y %H:%M:%S %z")
     msg.set_content(EMAIL_BODY)
 
-    # Allegato
     with open(path, "rb") as f:
         data = f.read()
     ext = os.path.splitext(path)[1].lower().strip(".") or "png"
@@ -176,14 +204,15 @@ def send_email_with_attachment(path: str) -> bool:
 
 
 def main():
-    # 1) Prendi l’ultimo forecast e costruisci l’URL mappa
+    # 1) trova l’ultimo forecast e costruisci l’URL della mappa
     fcst_url = find_latest_fcst_url(LIST_URL)
     img_url = to_map_image_url(fcst_url)
+    print(f"[INFO] URL immagine mappa: {img_url}")
 
-    # 2) Scarica l’immagine sempre (così puoi caricarla come artifact se vuoi)
+    # 2) scarica sempre l’immagine (così puoi caricarla come artifact)
     out_path = download_map_image(img_url, FILENAME_BASE)
 
-    # 3) Invia email solo se gate orario ok (o se forzato)
+    # 3) invia email solo se (gate orario ok) o forzato
     if guard_by_rome_hour():
         sent = send_email_with_attachment(out_path)
         if sent:
