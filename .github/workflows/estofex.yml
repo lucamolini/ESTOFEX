@@ -1,0 +1,52 @@
+name: Scarica mappa ESTOFEX e invia email
+
+on:
+  schedule:
+    # Esempio: 17:00 Europe/Rome -> 15:00 UTC (ora legale) e 16:00 UTC (ora solare)
+    - cron: "0 15 * * *"
+    - cron: "0 16 * * *"
+  workflow_dispatch:
+    inputs:
+      force_send:
+        description: "Forza invio anche fuori dall'orario Europe/Rome (se impostato)?"
+        required: false
+        default: "false"
+        type: choice
+        options: ["false", "true"]
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          pip install requests beautifulsoup4
+
+      - name: Run script (download mappa + invio email)
+        id: run_script
+        env:
+          LIST_URL: "https://www.estofex.org/cgi-bin/polygon/showforecast.cgi?list=yes"
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          FROM_EMAIL: ${{ secrets.FROM_EMAIL }}
+          TO_EMAIL: "luca.molini@cimafoundation.org"
+          EMAIL_SUBJECT: "ESTOFEX — mappa più recente"
+          EMAIL_BODY: "In allegato la mappa ESTOFEX più recente (storm forecast)."
+          FILENAME_BASE: "estofex_latest"
+          # Opzioni:
+          ROME_HOUR_GATE: ""              # lascia vuoto per inviare sempre; metti "17" per gate alle 17 Europe/Rome
+          FORCE_SEND: ${{ inputs.force_send }}
+          DEBUG_SMTP: "0"                 # metti "1" per log SMTP verbosi
+          CC_EMAILS: ""                   # opzionale, es. "planning@cimafoundation.org"
+          BCC_EMAILS: ""                  # opzionale
+        run: python estofex_mailer.py
