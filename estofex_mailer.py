@@ -18,7 +18,7 @@ FILENAME_BASE = os.getenv("FILENAME_BASE", "estofex_latest")
 
 TO_EMAIL = os.getenv("TO_EMAIL", "luca.molini@cimafoundation.org")
 EMAIL_SUBJECT = os.getenv("EMAIL_SUBJECT", "ESTOFEX — mappa più recente")
-EMAIL_BODY = os.getenv("EMAIL_BODY", "In allegato la mappa ESTOFEX più recente (storm forecast).")
+EMAIL_BODY = os.getenv("EMAIL_BODY", "In allegato la mappa ESTOFEX (https://www.estofex.org) più recente (storm forecast).")
 
 DEBUG_SMTP = os.getenv("DEBUG_SMTP", "0").strip() == "1"
 CC_EMAILS = os.getenv("CC_EMAILS", "").strip()
