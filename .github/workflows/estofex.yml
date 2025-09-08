@@ -3,7 +3,7 @@ name: Scarica mappa ESTOFEX e invia email
 on:
   schedule:
     # Esempio: 17:00 Europe/Rome -> 15:00 UTC (ora legale) e 16:00 UTC (ora solare)
-    - cron: "0 11 * * *"
+    # - cron: "0 11 * * *"
     - cron: "0 12 * * *"
   workflow_dispatch:
     inputs:
